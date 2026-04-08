@@ -1,0 +1,34 @@
+spec_version: 1
+name: securenet_env
+version: "1.0.0"
+description: "SOC Simulation: Stateful POMDP for Autonomous Digital Defense"
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
+environment:
+  spec: "securenet_env/server/securenet_environment.py:SecureNetEnvironment"
+  state_space: "Hidden (in-memory network graph of nodes)"
+  action_space:
+    - "QUERY_LOGS"
+    - "ANALYZE_PROCESS"
+    - "ISOLATE_HOST"
+    - "BLOCK_IP"
+
+hardware_limits:
+  vcpu: 2
+  ram_gb: 8
+  storage: "In-Memory"
+
+reward_function:
+  query_logs:            +0.20
+  isolate_infected:      +1.00
+  isolate_healthy:       -0.50
+  step_penalty:          -0.10
+  catastrophic_failure:  -2.00
+
+difficulty_tiers:
+  easy:   "2 nodes, 1 compromised, no adversarial drift"
+  medium: "4 nodes, 2 compromised, no adversarial drift"
+  hard:   "6 nodes, 2 compromised, adversarial drift every 3 steps"
