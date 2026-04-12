@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>SecureNet — SOC RL Training Dashboard v2</title>
+<meta name="description" content="Real-time cybersecurity SOC RL training dashboard with live network topology, MITRE ATT&CK kill chain, and threat intelligence feed."/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:       #030d0a;
+  --bg-c:     #061410;
+  --bg-c2:    #0a1f18;
+  --bdr:      #0d2b22;
+  --green:    #00ff88;
+  --blue:     #00c8ff;
+  --red:      #ff3050;
+  --orange:   #ff8800;
+  --yellow:   #ffdd00;
+  --purple:   #cc44ff;
+  --text:     #b0d8c8;
+  --muted:    #2a5040;
+  --mono:     'JetBrains Mono', monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%; font-family:'Inter',sans-serif; background:var(--bg); color:var(--text); overflow-x:hidden;}
+
+/* ─ Scanlines ─ */
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,255,136,0.012) 3px,rgba(0,255,136,0.012) 4px);}
+
+/* ─ Grid ─ */
+#bg-grid{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:linear-gradient(rgba(0,200,255,.025) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(0,200,255,.025) 1px,transparent 1px);
+  background-size:50px 50px;}
+
+.root{max-width:1440px;margin:0 auto;padding:0 20px;position:relative;z-index:1;}
+
+/* ─ Header ─ */
+header{padding:20px 0 16px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:14px;}
+.logo{width:44px;height:44px;border-radius:6px;display:flex;align-items:center;justify-content:center;
+  font-size:20px;border:1px solid var(--green);box-shadow:0 0 18px rgba(0,255,136,.35);
+  animation:glow 2s ease-in-out infinite alternate;}
+@keyframes glow{from{box-shadow:0 0 8px rgba(0,255,136,.2)}to{box-shadow:0 0 30px rgba(0,255,136,.6)}}
+.hdr-text h1{font-size:18px;font-weight:700;color:var(--green);text-transform:uppercase;letter-spacing:2px;}
+.hdr-text p {font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:2px;}
+.alert-badge{margin-left:auto;display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;
+  color:var(--red);border:1px solid var(--red);border-radius:4px;padding:5px 12px;
+  background:rgba(255,48,80,.07);animation:blink 1.4s ease-in-out infinite;}
+@keyframes blink{0%,100%{border-color:rgba(255,48,80,.4)}50%{border-color:var(--red)}}
+.alert-dot{width:7px;height:7px;border-radius:50%;background:var(--red);animation:p 1s ease infinite;}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.2}}
+
+/* ─ KPI Row ─ */
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:20px 0;}
+@media(max-width:1100px){.kpis{grid-template-columns:repeat(3,1fr);}}
+.kpi{background:var(--bg-c);border:1px solid var(--bdr);border-radius:8px;padding:14px 16px;position:relative;overflow:hidden;transition:border-color .3s;}
+.kpi:hover{border-color:var(--green);}
+.kpi::after{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(0,255,136,.04),transparent 60%);pointer-events:none;}
+.kl{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);}
+.kv{font-size:28px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums;color:var(--green);}
+.ks{font-size:10px;color:var(--muted);margin-top:2px;}
+.ki{position:absolute;right:12px;top:50%;transform:translateY(-50%);font-size:24px;opacity:.07;}
+.kpi.b .kv{color:var(--blue);}
+.kpi.r .kv{color:var(--red);}
+.kpi.y .kv{color:var(--yellow);}
+.kpi.p .kv{color:var(--purple);}
+
+/* ─ Kill Chain ─ */
+.kc-bar{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--bdr);border-radius:8px;overflow:hidden;}
+.kc-stage{flex:1;padding:8px 4px;text-align:center;font-size:10px;font-weight:600;font-family:var(--mono);
+  text-transform:uppercase;letter-spacing:.5px;border-right:1px solid var(--bdr);color:var(--muted);
+  background:var(--bg-c);transition:background .5s,color .5s;}
+.kc-stage:last-child{border-right:none;}
+.kc-stage.active{background:rgba(255,136,0,.15);color:var(--orange);border-color:var(--orange);}
+.kc-stage.done{background:rgba(0,255,136,.1);color:var(--green);}
+
+/* ─ Main Grid ─ */
+.main{display:grid;grid-template-columns:1fr 420px;gap:14px;margin-bottom:14px;}
+@media(max-width:1100px){.main{grid-template-columns:1fr;}}
+
+/* ─ Network Topology ─ */
+.topo-card{background:var(--bg-c);border:1px solid var(--bdr);border-radius:8px;padding:16px;}
+.card-title{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;
+  font-family:var(--mono);margin-bottom:12px;display:flex;align-items:center;gap:8px;}
+.card-title span{color:var(--green);}
+#topo-canvas{width:100%;height:320px;border-radius:6px;background:var(--bg-c2);border:1px solid var(--bdr);display:block;}
+
+/* ─ Right Panel ─ */
+.right-panel{display:flex;flex-direction:column;gap:12px;}
+
+/* ─ Action Log ─ */
+.log-card{background:var(--bg-c);border:1px solid var(--bdr);border-radius:8px;padding:14px;flex:1;}
+.log-feed{font-family:var(--mono);font-size:11px;height:220px;overflow-y:auto;display:flex;flex-direction:column-reverse;}
+.log-feed::-webkit-scrollbar{width:3px;}
+.log-feed::-webkit-scrollbar-thumb{background:var(--bdr);}
+.log-entry{padding:4px 8px;border-radius:4px;margin-bottom:3px;display:flex;gap:8px;align-items:baseline;
+  background:var(--bg-c2);border-left:2px solid transparent;animation:fadeIn .2s ease;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
+.le-q{border-left-color:var(--blue);}
+.le-a{border-left-color:var(--yellow);}
+.le-i{border-left-color:var(--green);}
+.le-b{border-left-color:var(--purple);}
+.le-t{border-left-color:var(--orange);}
+.le-qr{border-left-color:var(--red);}
+.le-cat{border-left-color:#ff0000;background:rgba(255,0,0,.1);}
+.l-step{color:var(--muted);min-width:22px;}
+.l-act{min-width:160px;color:var(--text);}
+.l-rwd{margin-left:auto;font-weight:600;}
+
+/* ─ Threat Intel Panel ─ */
+.intel-card{background:var(--bg-c);border:1px solid var(--bdr);border-radius:8px;padding:14px;}
+.intel-list{display:flex;flex-direction:column;gap:6px;max-height:160px;overflow-y:auto;}
+.intel-row{font-family:var(--mono);font-size:10px;padding:5px 8px;background:var(--bg-c2);border-radius:4px;
+  border-left:2px solid var(--muted);display:flex;gap:8px;align-items:center;}
+.intel-row.CRITICAL{border-left-color:var(--red);}
+.intel-row.HIGH{border-left-color:var(--orange);}
+.intel-row.MEDIUM{border-left-color:var(--yellow);}
+.ioc-text{color:var(--blue);min-width:120px;}
+.ioc-actor{color:var(--muted);}
+.ioc-lvl{margin-left:auto;font-weight:700;}
+.ioc-lvl.CRITICAL{color:var(--red);}
+.ioc-lvl.HIGH{color:var(--orange);}
+.ioc-lvl.MEDIUM{color:var(--yellow);}
+
+/* ─ Charts ─ */
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
+@media(max-width:900px){.charts{grid-template-columns:1fr;}}
+.chart-card{background:var(--bg-c);border:1px solid var(--bdr);border-radius:8px;padding:14px;}
+.chart-card h3{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;
+  font-family:var(--mono);margin-bottom:10px;}
+.cw{position:relative;height:180px;}
+
+/* ─ Diff Badge ─ */
+.diff-badge{display:inline-flex;align-items:center;gap:6px;margin-top:6px;
+  padding:3px 10px;border-radius:4px;font-size:10px;font-weight:600;font-family:var(--mono);
+  background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.3);color:var(--green);}
+
+footer{text-align:center;padding:18px 0;font-size:10px;color:var(--muted);
+  border-top:1px solid var(--bdr);font-family:var(--mono);}
+</style>
+</head>
+<body>
+<div id="bg-grid"></div>
+<div class="root">
+
+<!-- Header -->
+<header>
+  <div class="logo">🛡️</div>
+  <div class="hdr-text">
+    <h1>SecureNet SOC — RL Dashboard v2</h1>
+    <p>mitre_attck_v14 · pomdp_stateful · adversarial_drift · curriculum_learning · threat_intel_ioc</p>
+  </div>
+  <div class="alert-badge"><div class="alert-dot"></div>INCIDENT ACTIVE</div>
+</header>
+
+<!-- KPIs -->
+<div class="kpis">
+  <div class="kpi">
+    <div class="kl">Episodes</div>
+    <div class="kv" id="kv-ep">0</div>
+    <div class="ks">total training</div>
+    <div class="ki">🔄</div>
+    <div class="diff-badge" id="diff-badge">💡 EASY</div>
+  </div>
+  <div class="kpi b">
+    <div class="kl">Avg Containment Score</div>
+    <div class="kv" id="kv-score">—</div>
+    <div class="ks">last 50 episodes</div>
+    <div class="ki">🎯</div>
+  </div>
+  <div class="kpi r">
+    <div class="kl">Avg Episode Reward</div>
+    <div class="kv" id="kv-reward">—</div>
+    <div class="ks">last 50 episodes</div>
+    <div class="ki">⚡</div>
+  </div>
+  <div class="kpi y">
+    <div class="kl">Best Score</div>
+    <div class="kv" id="kv-best">—</div>
+    <div class="ks">all-time peak</div>
+    <div class="ki">🏆</div>
+  </div>
+  <div class="kpi p">
+    <div class="kl">Active Threats</div>
+    <div class="kv" id="kv-threats">—</div>
+    <div class="ks">this episode</div>
+    <div class="ki">☠️</div>
+  </div>
+</div>
+
+<!-- Kill Chain Bar -->
+<div class="kc-bar" id="kc-bar">
+  <div class="kc-stage" data-i="0">Reconnaissance</div>
+  <div class="kc-stage" data-i="1">Initial Access</div>
+  <div class="kc-stage" data-i="2">Persistence</div>
+  <div class="kc-stage" data-i="3">Lateral Movement</div>
+  <div class="kc-stage" data-i="4">Exfiltration</div>
+</div>
+
+<!-- Charts -->
+<div class="charts">
+  <div class="chart-card">
+    <h3>📈 Episode Reward</h3>
+    <div class="cw"><canvas id="cr"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>🎯 Containment Score</h3>
+    <div class="cw"><canvas id="cs"></canvas></div>
+  </div>
+</div>
+
+<!-- Main Grid -->
+<div class="main">
+  <!-- Network Topology Canvas -->
+  <div class="topo-card">
+    <div class="card-title">🌐 Live Network Topology — Episode <span id="ep-n">—</span></div>
+    <canvas id="topo-canvas"></canvas>
+  </div>
+
+  <!-- Right Panel -->
+  <div class="right-panel">
+    <!-- Action Log -->
+    <div class="log-card">
+      <div class="card-title">📋 Action Feed</div>
+      <div class="log-feed" id="log-feed">
+        <div class="log-entry" style="border-left-color:var(--muted)">
+          <span class="l-act" style="color:var(--muted)">Waiting for agent...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Threat Intel Panel -->
+    <div class="intel-card">
+      <div class="card-title">🔍 IOC Threat Intelligence Feed</div>
+      <div class="intel-list" id="intel-list">
+        <div class="intel-row"><span class="ioc-text">Loading...</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /root -->
+<footer>SecureNet SOC RL v2 · FastAPI + PyTorch · MITRE ATT&CK v14 · Zero External Cloud · In-Memory POMDP</footer>
+
+<script>
+const API = '';
+let bestScore = 0, lastEp = null, lastStep = 0;
+
+// ── Charts ──────────────────────────────────────
+const mkChart = (id, color) => new Chart(document.getElementById(id).getContext('2d'), {
+  type:'line',
+  data:{labels:[],datasets:[
+    {label:'Raw',data:[],borderColor:color+'44',borderWidth:1,pointRadius:0,tension:.3},
+    {label:'Roll(50)',data:[],borderColor:color,borderWidth:2,pointRadius:0,tension:.4,fill:{target:'origin',above:color+'12'}}
+  ]},
+  options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},
+    plugins:{legend:{labels:{color:'#2a5040',font:{size:10}}}},
+    scales:{x:{ticks:{color:'#2a5040',maxTicksLimit:8,font:{size:9}},grid:{color:'#0d2b22'}},
+            y:{ticks:{color:'#2a5040',font:{size:9}},grid:{color:'#0d2b22'}}}}
+});
+const chartR = mkChart('cr','#ff3050');
+const chartS = mkChart('cs','#00ff88');
+
+const roll = (a,n) => a.map((_,i)=>i<n-1?null:a.slice(i-n+1,i+1).reduce((s,v)=>s+v,0)/n);
+const avg  = a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:null;
+
+// ── Kill Chain Bar ──────────────────────────────
+function updateKC(idx) {
+  document.querySelectorAll('.kc-stage').forEach((el,i)=>{
+    el.className='kc-stage '+(i<idx?'done':i===idx?'active':'');
+  });
+}
+
+// ── Stats Poll ──────────────────────────────────
+function updateStats(stats) {
+  const R=stats.rewards||[], S=stats.scores||[];
+  if(!R.length) return;
+  const labels=Array.from({length:R.length},(_,i)=>i+1);
+  chartR.data.labels=labels; chartR.data.datasets[0].data=R; chartR.data.datasets[1].data=roll(R,50); chartR.update();
+  chartS.data.labels=labels; chartS.data.datasets[0].data=S; chartS.data.datasets[1].data=roll(S,50); chartS.update();
+  const l50r=R.slice(-50),l50s=S.slice(-50);
+  document.getElementById('kv-ep').textContent=R.length;
+  document.getElementById('kv-score').textContent=avg(l50s)!==null?avg(l50s).toFixed(3):'—';
+  document.getElementById('kv-reward').textContent=avg(l50r)!==null?avg(l50r).toFixed(3):'—';
+  const p=Math.max(...S);if(p>bestScore)bestScore=p;
+  document.getElementById('kv-best').textContent=bestScore>0?bestScore.toFixed(3):'—';
+  const dm={easy:'💡 EASY',medium:'⚡ MEDIUM',hard:'🔥 HARD',critical:'☠️ CRITICAL',nightmare:'💀 NIGHTMARE'};
+  document.getElementById('diff-badge').textContent=dm[stats.difficulty]||'💡 EASY';
+}
+
+// ── Network Topology Canvas ─────────────────────
+const canvas=document.getElementById('topo-canvas');
+const ctx=canvas.getContext('2d');
+let topoData=null;
+function resizeCanvas(){canvas.width=canvas.offsetWidth;canvas.height=canvas.offsetHeight||320;}
+window.addEventListener('resize',()=>{resizeCanvas();if(topoData)drawTopo(topoData);});
+resizeCanvas();
+
+const NODE_COLORS={
+  healthy:'#00ff88', infected:'#ff3050', isolated:'#2a5040', unknown:'#ffdd00'
+};
+const TYPE_ICONS={endpoint:'💻',server:'🖥️',database:'🗄️',network:'🌐'};
+
+let nodePositions={};
+
+function layoutNodes(nodes, topology) {
+  const names=Object.keys(nodes);
+  const W=canvas.width, H=canvas.height;
+  const cx=W/2, cy=H/2, r=Math.min(W,H)*0.36;
+  const pos={};
+  names.forEach((n,i)=>{
+    const angle=(2*Math.PI*i/names.length)-Math.PI/2;
+    pos[n]={x:cx+r*Math.cos(angle), y:cy+r*Math.sin(angle)};
+  });
+  return pos;
+}
+
+function drawTopo(state) {
+  topoData=state;
+  resizeCanvas();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const nodes=state.network||{};
+  const topo=state.topology||{};
+  const iso=state.isolated||[];
+  const names=Object.keys(nodes);
+  if(!names.length)return;
+  nodePositions=layoutNodes(nodes,topo);
+
+  // Draw edges
+  ctx.save();
+  for(const[src,dsts] of Object.entries(topo)){
+    for(const dst of dsts){
+      const a=nodePositions[src],b=nodePositions[dst];
+      if(!a||!b)continue;
+      const srcInf=nodes[src]?.status==='infected';
+      const dstInf=nodes[dst]?.status==='infected';
+      ctx.beginPath();
+      ctx.moveTo(a.x,a.y);
+      ctx.lineTo(b.x,b.y);
+      if(srcInf||dstInf){
+        ctx.strokeStyle='rgba(255,48,80,0.5)';
+        ctx.lineWidth=2;
+        ctx.setLineDash([5,5]);
+      } else {
+        ctx.strokeStyle='rgba(0,200,255,0.15)';
+        ctx.lineWidth=1;
+        ctx.setLineDash([]);
+      }
+      ctx.stroke();
+    }
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Draw nodes
+  for(const[name,node] of Object.entries(nodes)){
+    const pos=nodePositions[name];
+    if(!pos)continue;
+    const status=iso.includes(name)?'isolated':node.status||'unknown';
+    const col=NODE_COLORS[status]||'#ffdd00';
+    const R=status==='infected'?22:18;
+
+    // Glow for infected
+    if(status==='infected'){
+      const grad=ctx.createRadialGradient(pos.x,pos.y,R*0.5,pos.x,pos.y,R*2.5);
+      grad.addColorStop(0,'rgba(255,48,80,0.4)');
+      grad.addColorStop(1,'rgba(255,48,80,0)');
+      ctx.fillStyle=grad;
+      ctx.beginPath();
+      ctx.arc(pos.x,pos.y,R*2.5,0,Math.PI*2);
+      ctx.fill();
+    }
+
+    // Node circle
+    ctx.beginPath();
+    ctx.arc(pos.x,pos.y,R,0,Math.PI*2);
+    ctx.fillStyle=`${col}22`;
+    ctx.fill();
+    ctx.strokeStyle=col;
+    ctx.lineWidth=status==='infected'?2.5:1.5;
+    ctx.stroke();
+
+    // Critical star
+    if(node.critical){
+      ctx.fillStyle='rgba(255,220,0,0.6)';
+      ctx.font='10px sans-serif';
+      ctx.textAlign='center';
+      ctx.fillText('★',pos.x,pos.y-R-4);
+    }
+
+    // Icon
+    ctx.font=`${status==='infected'?14:12}px sans-serif`;
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(TYPE_ICONS[node.node_type]||'📡',pos.x,pos.y);
+
+    // Label
+    ctx.font='bold 10px JetBrains Mono, monospace';
+    ctx.textBaseline='top';
+    ctx.fillStyle=col;
+    const label=name.length>12?name.slice(0,11)+'…':name;
+    ctx.fillText(label,pos.x,pos.y+R+4);
+  }
+
+  // Kill chain idx label
+  ctx.font='10px JetBrains Mono';
+  ctx.fillStyle='rgba(0,200,255,0.4)';
+  ctx.textAlign='left';
+  ctx.textBaseline='bottom';
+  ctx.fillText(`Kill Chain: ${state.kill_chain||''}`,8,canvas.height-6);
+}
+
+// ── Action Log ──────────────────────────────────
+function updateLog({log,episode}) {
+  document.getElementById('ep-n').textContent=episode;
+  const feed=document.getElementById('log-feed');
+  if(episode!==lastEp||log.length<lastStep){feed.innerHTML='';lastEp=episode;lastStep=0;}
+  const newE=log.slice(lastStep);
+  lastStep=log.length;
+  newE.forEach(e=>{
+    const div=document.createElement('div');
+    const t=e.action_type;
+    const cls=t.includes('query')?'le-q':t.includes('analyze')?'le-a':t.includes('isolate')?'le-i':
+               t.includes('block')?'le-b':t.includes('intel')?'le-t':t.includes('quarantine')?'le-qr':'';
+    const isCat=e.reward<-1.5;
+    div.className=`log-entry ${isCat?'le-cat':cls}`;
+    const rc=e.reward>0?'var(--green)':e.reward<-1?'var(--red)':'var(--red)';
+    const tgt=e.target_node||e.ip_address||e.ioc||'';
+    div.innerHTML=`<span class="l-step">#${e.step}</span>
+      <span class="l-act">${t.replace(/_/g,' ')}</span>
+      <span style="color:var(--muted);font-size:10px">${tgt}</span>
+      <span class="l-rwd" style="color:${rc}">${e.reward>=0?'+':''}${e.reward.toFixed(2)}</span>`;
+    feed.prepend(div);
+  });
+}
+
+// ── Active Threats ─────────────────────────────
+function updateThreats(state){
+  const comp=(state.compromised||[]).length;
+  document.getElementById('kv-threats').textContent=comp;
+  updateKC(state.kill_chain_idx??0);
+  drawTopo(state);
+}
+
+// ── IOC Feed ────────────────────────────────────
+async function loadIOC(){
+  try{
+    const data=await fetch(`${API}/threat_intel_db`).then(r=>r.json());
+    const list=document.getElementById('intel-list');
+    list.innerHTML='';
+    Object.entries(data).slice(0,10).forEach(([ioc,rec])=>{
+      const div=document.createElement('div');
+      div.className=`intel-row ${rec.threat}`;
+      div.innerHTML=`<span class="ioc-text">${ioc}</span>
+        <span class="ioc-actor">${rec.actor}</span>
+        <span style="color:var(--muted);font-size:9px">${rec.mitre}</span>
+        <span class="ioc-lvl ${rec.threat}">${rec.threat}</span>`;
+      list.appendChild(div);
+    });
+  }catch(e){}
+}
+
+// ── Poll Loop ────────────────────────────────────
+async function poll(){
+  try{
+    const [stats,logData,state]=await Promise.all([
+      fetch(`${API}/stats`).then(r=>r.json()),
+      fetch(`${API}/episode_log`).then(r=>r.json()),
+      fetch(`${API}/state`).then(r=>r.json()),
+    ]);
+    updateStats(stats);
+    updateLog(logData);
+    updateThreats(state);
+  }catch(e){}
+}
+
+loadIOC();
+setInterval(poll,1500);
+poll();
+</script>
+</body>
+</html>

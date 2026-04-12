@@ -1,29 +1,28 @@
 """
-SecureNet — Dueling DQN Trainer (No HTTP)
-==========================================
-Algorithm : Dueling Deep Q-Network
-          + Experience Replay (circular buffer)
-          + Target Network (hard update every N steps)
-          + Epsilon-greedy exploration (1.0 → 0.05 over training)
-          + 5-tier curriculum (easy → nightmare)
-
-Why DQN over REINFORCE?
-  • Replay buffer breaks temporal correlations that plateau REINFORCE
-  • Target network gives stable Q-value targets (no oscillating loss)
-  • Epsilon-greedy is far more effective than entropy noise for sparse rewards
-  • Dueling arch separates state value from action advantage → faster convergence
-
-Expected results:
-  ~500  episodes → 0.5+ score (EASY mastered)
-  ~1500 episodes → 0.7+ score (MEDIUM mastered)
-  ~3000 episodes → 0.8+ score (HARD with adversarial drift)
+SecureNet - Dueling DQN Trainer v3
+====================================
+Key improvements over v2:
+  * ACTION MASKING per scenario  - only ~15-20 valid actions per difficulty
+    instead of 110 random ones. Cuts wasted exploration by ~85%.
+  * RICHER STATE  - adds step fraction, queried/analyzed coverage ratios,
+    threats-remaining count, blocked-IP flags. Agent can now reason about
+    episode progress, not just raw log text.
+  * SOFT TARGET UPDATES  - smoother Q-target tracking (tau=0.01 per step)
+    instead of periodic hard copies that cause instability.
+  * COSINE LR SCHEDULE  - gradually anneals learning rate for stable fine-tuning.
+  * SEQUENTIAL TIER TRAINING  - one difficulty at a time avoids CPU contention.
+  * HONEST SAVE  - checkpoints written every 50 episodes so interruptions lose
+    at most 50 episodes, not 100.
 
 Usage:
-  python securenet_env/train_dqn.py
-  python securenet_env/train_dqn.py --episodes 5000
+  # Train one tier (5000 episodes)
+  python securenet_env/train_dqn.py --difficulty easy --episodes 5000
+
+  # Sequential auto (easy -> medium -> ... -> nightmare, 5000 each)
+  python securenet_env/train_dqn.py --difficulty sequential --episodes 5000
 """
 
-import os, sys, json, time, argparse, random
+import os, sys, json, time, argparse, random, math
 from collections import deque
 import numpy as np
 import torch
@@ -33,36 +32,75 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "server"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from securenet_environment import SecureNetEnvironment
+from securenet_environment import SecureNetEnvironment, NETWORK_TEMPLATES, THREAT_INTEL_DB
+
+STDOUT_ENC = sys.stdout.reconfigure(encoding="utf-8", errors="replace") if hasattr(sys.stdout, "reconfigure") else None
 
 # ─────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
 # ─────────────────────────────────────────────────────────────────────
 DEFAULTS = dict(
-    episodes          = 4000,
-    lr                = 5e-4,
-    gamma             = 0.99,
-    batch_size        = 128,
-    buffer_size       = 20_000,
-    target_update     = 200,       # hard-copy online → target every N steps
-    eps_start         = 1.0,
-    eps_end           = 0.05,
-    eps_decay_steps   = 3000,      # episodes over which epsilon decays
-    log_interval      = 100,
-    checkpoint        = "securenet_env/checkpoints/policy_dqn.pt",
-    stats_out         = "securenet_env/checkpoints/stats.json",
-    difficulty        = "progressive",
+    episodes        = 5000,
+    lr              = 2e-4,
+    gamma           = 0.99,
+    batch_size      = 128,
+    buffer_size     = 50_000,
+    tau             = 0.005,         # soft target update coefficient
+    eps_start       = 1.0,
+    eps_end         = 0.05,
+    eps_decay_steps = 4000,
+    log_interval    = 50,
+    save_interval   = 50,
+    difficulty      = "sequential",
+    checkpoint_dir  = "checkpoints",
 )
 
-CURRICULUM = [
-    ("easy",      "medium",    0.45),
-    ("medium",    "hard",      0.55),
-    ("hard",      "critical",  0.65),
-    ("critical",  "nightmare", 0.75),
-]
+TIERS = ["easy", "medium", "hard", "critical", "nightmare"]
 
 # ─────────────────────────────────────────────────────────────────────
-# VOCABULARY  (118 tokens, shared with train_fast.py)
+# PER-TIER ACTION MASKS
+# Only include nodes/IPs/IOCs that are actually present in each scenario.
+# This reduces the effective action space from 110 to ~15-25 actions.
+# ─────────────────────────────────────────────────────────────────────
+def build_action_mask(difficulty: str):
+    """Return the list of (action_type, node, ip, ioc, proc) tuples valid for this difficulty."""
+    tmpl = NETWORK_TEMPLATES[difficulty]
+    nodes = list(tmpl["nodes"].keys())
+    att_ips = tmpl.get("attacker_ips", [])
+    all_iocs = list(THREAT_INTEL_DB.keys())
+
+    # Quarantine pairs specific to this scenario
+    sus_processes = {}
+    for node, ndata in tmpl["nodes"].items():
+        for proc in ndata.get("processes", []):
+            if any(w in proc.lower() for w in ["malicious", "mimikatz", "lockbit", "psexec",
+                                                "/tmp/", "/bin/sh", "svc_update", "webshell",
+                                                "cryptominer", "ntds-dumper", "keylogger",
+                                                "xtrabackup", "python3 (c2", "malicious-build"]):
+                sus_processes.setdefault(node, []).append(proc)
+
+    actions = []
+    for n in nodes:
+        actions.append(("query_logs",      n,    None, None, None))
+        actions.append(("analyze_process", n,    None, None, None))
+        actions.append(("isolate_host",    n,    None, None, None))
+    for ip in att_ips:
+        actions.append(("block_ip",        None, ip,   None, None))
+    for ioc in all_iocs:
+        actions.append(("threat_intel",    None, None, ioc,  None))
+    for node, procs in sus_processes.items():
+        for proc in procs:
+            actions.append(("quarantine_process", node, None, None, proc))
+
+    return actions
+
+
+MASKED_ACTIONS = {d: build_action_mask(d) for d in TIERS}
+MAX_ACTIONS = max(len(v) for v in MASKED_ACTIONS.values())
+
+# ─────────────────────────────────────────────────────────────────────
+# STATE REPRESENTATION
+# Text BOW (118 VOCAB) + structured scalars (step %, coverage %, threats, IPs blocked, ...)
 # ─────────────────────────────────────────────────────────────────────
 VOCAB = [
     "workstation","server","database","laptop","firewall","backup","node","router","switch",
@@ -76,78 +114,58 @@ VOCAB = [
     "supply","chain","firmware","poisoned","artifact","build","deploy",
     "10.0.0","192.168","172.16","185.220","193.56","45.33","91.92","45.142","update-cdn",
     "t1486","t1110","t1059","t1003","t1190","t1505","t1610","t1195","t1568","t1041",
-    "easy","medium","hard","critical","nightmare","initialized","curriculum","kill","chain",
+    "easy","medium","hard","critical","nightmare",
     "reconnaissance","initial","access","persistence","exfiltration","impact",
     "sla","violation","catastrophic","failure","timeout","score","grader",
+    # node identifiers
+    "workstation-a","server-1","workstation-b","database-primary","mail-server","hr-workstation",
+    "node-1","node-2","node-3","ceo-laptop","firewall-gw","backup-server",
+    "dmz-webserver","ad-domain-controller","finance-workstation",
+    "edr-server","vpn-gateway","siem-platform",
+    "internet-router","core-switch","prod-db-primary","k8s-master",
+    "ci-cd-pipeline","hsm-server","backup-vault","ciso-workstation",
 ]
-
-# ─────────────────────────────────────────────────────────────────────
-# ACTION SPACE  (110 actions — pruned quarantine combos)
-# ─────────────────────────────────────────────────────────────────────
-ALL_NODES = [
-    "Workstation-A","Server-1",
-    "Workstation-B","Database-Primary","Mail-Server","HR-Workstation",
-    "Node-1","Node-2","Node-3","CEO-Laptop","Firewall-GW","Backup-Server",
-    "DMZ-WebServer","AD-Domain-Controller","Finance-Workstation",
-    "EDR-Server","VPN-Gateway","SIEM-Platform",
-    "Internet-Router","Core-Switch","Prod-DB-Primary","K8s-Master",
-    "CI-CD-Pipeline","HSM-Server","Backup-Vault","CISO-Workstation",
-]
-ALL_IPS  = ["10.0.0.99","45.33.32.156","172.16.0.200","185.220.101.45",
-            "193.56.29.11","45.142.212.100","91.92.109.200"]
-ALL_IOCS = ALL_IPS + ["a3f4b9c1d2e5","deadbeef1234","cafebabe5678","update-cdn.ru","telemetry.xyz"]
-QUARANTINE_PAIRS = [
-    ("Server-1",             "/tmp/.x (malicious)"),
-    ("Workstation-B",        "mimikatz.exe"),
-    ("Node-1",               "LockBit3.exe"),
-    ("Node-1",               "PsExec.exe"),
-    ("DMZ-WebServer",        "webshell.php (malicious)"),
-    ("AD-Domain-Controller", "ntds-dumper.exe (malicious)"),
-    ("Backup-Server",        "svc_update (malicious)"),
-    ("K8s-Master",           "cryptominer (malicious)"),
-    ("Prod-DB-Primary",      "xtrabackup (malicious)"),
-    ("Finance-Workstation",  "keylogger.dll (malicious)"),
-    ("Mail-Server",          "/bin/sh -i (malicious)"),
-    ("CI-CD-Pipeline",       "malicious-build-step.sh"),
-    ("Prod-DB-Primary",      "python3 (c2-agent)"),
-]
-ACTIONS = (
-    [("query_logs",         n,    None, None, None) for n in ALL_NODES] +
-    [("analyze_process",    n,    None, None, None) for n in ALL_NODES] +
-    [("isolate_host",       n,    None, None, None) for n in ALL_NODES] +
-    [("block_ip",           None, ip,   None, None) for ip in ALL_IPS]  +
-    [("threat_intel",       None, None, ioc,  None) for ioc in ALL_IOCS] +
-    [("quarantine_process", n,    None, None, proc) for n, proc in QUARANTINE_PAIRS]
-)
-ACTION_SIZE = len(ACTIONS)
-
-VOCAB = VOCAB + [n.lower() for n in ALL_NODES] + [ip.lower() for ip in ALL_IPS] + [ioc.lower() for ioc in ALL_IOCS]
-VOCAB = list(dict.fromkeys(VOCAB))
+VOCAB = list(dict.fromkeys(VOCAB))   # deduplicate
 VOCAB_SIZE = len(VOCAB)
-STATE_DIM = VOCAB_SIZE + ACTION_SIZE
+SCALAR_DIM = 8    # step_frac, threats_remain_norm, n_isolated_norm, n_blocked_norm,
+                  # queried_frac, analyzed_frac, ep_reward_norm, last_reward_norm
+STATE_DIM = VOCAB_SIZE + SCALAR_DIM
 
-# ─────────────────────────────────────────────────────────────────────
-# FEATURES
-# ─────────────────────────────────────────────────────────────────────
-def obs_to_vec(text: str, last_action: int = -1, prev_state: torch.Tensor = None) -> torch.Tensor:
+
+def obs_to_vec(text: str, scalars: list, prev: torch.Tensor = None) -> torch.Tensor:
     lo  = text.lower()
-    vec = torch.zeros(STATE_DIM, dtype=torch.float32)
+    bow = torch.zeros(VOCAB_SIZE, dtype=torch.float32)
     for i, w in enumerate(VOCAB):
         if w in lo:
-            vec[i] = 1.0
-    if last_action >= 0:
-        vec[VOCAB_SIZE + last_action] = 1.0
-    
-    if prev_state is not None:
-        vec = torch.clamp(vec + prev_state * 0.9, 0.0, 1.0)
+            bow[i] = 1.0
+            
+    if prev is not None:
+        # Apply smoothing only to the textual Bag of Words, NOT the scalars
+        prev_bow = prev[:VOCAB_SIZE]
+        bow = torch.clamp(bow + prev_bow * 0.7, 0.0, 1.0)
+        
+    sc = torch.tensor(scalars, dtype=torch.float32)
+    vec = torch.cat([bow, sc])
     return vec
 
+
+def get_scalars(env, resp) -> list:
+    info = resp.get("info", {})
+    n_nodes    = max(len(env.network), 1)
+    n_infected = len(env._tmpl.get("compromised", []))
+    remain     = len(env.compromised) / max(n_infected, 1)
+    step_frac  = env.step_count / max(env.max_steps, 1)
+    iso_frac   = len(env.isolated)  / max(n_nodes, 1)
+    blk_frac   = len(env.blocked_ips) / max(len(env._tmpl.get("attacker_ips", [1])), 1)
+    q_frac     = len(env.queried_nodes)    / max(n_nodes, 1)
+    a_frac     = len(env.analyzed_nodes)   / max(n_nodes, 1)
+    ep_r       = max(min(info.get("episode_reward", 0) / 10.0, 1.0), -1.0)
+    last_r     = max(min(resp.get("reward", 0) / 2.0, 1.0), -1.0)
+    return [step_frac, remain, iso_frac, blk_frac, q_frac, a_frac, ep_r, last_r]
+
+
 # ─────────────────────────────────────────────────────────────────────
-# DUELING DQN NETWORK
-#   Input  → shared trunk → split into
-#     Value stream     V(s)        →  scalar
-#     Advantage stream A(s, a)     →  vector[ACTION_SIZE]
-#   Q(s,a) = V(s) + A(s,a) - mean_a(A(s,a))
+# DUELING DQN
 # ─────────────────────────────────────────────────────────────────────
 class DuelingDQN(nn.Module):
     def __init__(self, in_dim: int, act_dim: int):
@@ -156,23 +174,15 @@ class DuelingDQN(nn.Module):
             nn.Linear(in_dim, 512), nn.LayerNorm(512), nn.ReLU(),
             nn.Linear(512, 256),    nn.LayerNorm(256), nn.ReLU(),
         )
-        # Value stream
-        self.value = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 1),
-        )
-        # Advantage stream
-        self.advantage = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, act_dim),
-        )
+        self.value = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1))
+        self.adv   = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, act_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h   = self.trunk(x)
-        v   = self.value(h)                        # (B, 1)
-        a   = self.advantage(h)                    # (B, A)
-        q   = v + a - a.mean(dim=1, keepdim=True)  # (B, A)
-        return q
+        h = self.trunk(x)
+        v = self.value(h)
+        a = self.adv(h)
+        return v + a - a.mean(dim=1, keepdim=True)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # REPLAY BUFFER
@@ -181,8 +191,8 @@ class ReplayBuffer:
     def __init__(self, capacity: int):
         self.buf = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
-        self.buf.append((state, action, reward, next_state, done))
+    def push(self, s, a, r, ns, d):
+        self.buf.append((s, a, r, ns, d))
 
     def sample(self, batch_size: int):
         batch = random.sample(self.buf, batch_size)
@@ -198,211 +208,219 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buf)
 
+
 # ─────────────────────────────────────────────────────────────────────
-# TRAINING LOOP
+# TRAIN ONE TIER
 # ─────────────────────────────────────────────────────────────────────
-def train(args):
-    os.makedirs(os.path.dirname(args.checkpoint), exist_ok=True)
+def train_tier(difficulty: str, episodes: int, args, resume_path: str = None,
+               online: DuelingDQN = None, target: DuelingDQN = None,
+               opt=None, buf: ReplayBuffer = None):
 
-    env       = SecureNetEnvironment()
-    online    = DuelingDQN(STATE_DIM, ACTION_SIZE)
-    target    = DuelingDQN(STATE_DIM, ACTION_SIZE)
-    target.load_state_dict(online.state_dict())
-    target.eval()
+    actions    = MASKED_ACTIONS[difficulty]
+    act_dim    = len(actions)
+    env        = SecureNetEnvironment()
 
-    opt       = optim.Adam(online.parameters(), lr=args.lr)
-    buf       = ReplayBuffer(args.buffer_size)
+    # Build fresh networks if not provided (first tier or no transfer)
+    if online is None:
+        online = DuelingDQN(STATE_DIM, act_dim)
+        target = DuelingDQN(STATE_DIM, act_dim)
+        target.load_state_dict(online.state_dict())
+        target.eval()
+        opt = optim.Adam(online.parameters(), lr=args.lr)
+    else:
+        # Re-build output head for new action dim while keeping trunk weights
+        old_adv_in = online.adv[0].in_features
+        online.adv = nn.Sequential(nn.Linear(old_adv_in, 128), nn.ReLU(), nn.Linear(128, act_dim))
+        target.adv = nn.Sequential(nn.Linear(old_adv_in, 128), nn.ReLU(), nn.Linear(128, act_dim))
+        target.load_state_dict(online.state_dict())
+        target.eval()
+        opt = optim.Adam(online.parameters(), lr=args.lr)
 
-    difficulty     = "easy" if args.difficulty == "progressive" else args.difficulty
-    all_rewards    = []
-    all_scores     = []
-    score_history  = []
-    global_step    = 0
-    start_ep       = 1
+    if buf is None:
+        buf = ReplayBuffer(args.buffer_size)
 
-    # Resume
-    if os.path.exists(args.checkpoint):
+    ckpt_path  = os.path.join(args.checkpoint_dir, f"{difficulty}.pt")
+    stats_path = os.path.join(args.checkpoint_dir, f"{difficulty}.json")
+
+    all_rewards, all_scores = [], []
+    global_step = 0
+    start_ep    = 1
+
+    # Resume from checkpoint
+    if resume_path and os.path.exists(resume_path):
         try:
-            ckpt = torch.load(args.checkpoint, weights_only=True)
+            ckpt = torch.load(resume_path, weights_only=True)
             online.load_state_dict(ckpt["online"])
             target.load_state_dict(ckpt["target"])
             opt.load_state_dict(ckpt["optimizer"])
-            start_ep   = ckpt.get("episode", 1) + 1
-            difficulty = ckpt.get("difficulty", "easy")
+            start_ep    = ckpt.get("episode", 1) + 1
             global_step = ckpt.get("global_step", 0)
-            print(f"▶ Resumed from ep {start_ep-1}  difficulty={difficulty}  step={global_step}")
+            print(f"  Resumed from ep {start_ep-1}  step={global_step}")
         except Exception as e:
-            print(f"⚠ Checkpoint load failed ({e}) — starting fresh.")
+            print(f"  Checkpoint load failed ({e}) - starting fresh.")
 
-    # Epsilon schedule
+    # Load existing stats
+    if os.path.exists(stats_path):
+        try:
+            with open(stats_path) as f:
+                d = json.load(f)
+            all_rewards = d.get("rewards", [])
+            all_scores  = d.get("scores",  [])
+        except Exception:
+            pass
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=episodes, eta_min=args.lr/10)
+
     def epsilon(ep: int) -> float:
         frac = min(ep / args.eps_decay_steps, 1.0)
-        return args.eps_start + (args.eps_end - args.eps_start) * frac
+        base = args.eps_start + (args.eps_end - args.eps_start) * frac
+        
+        # Disable cyclic epsilon in the final 500 episodes to allow fully exploitative convergence
+        if ep > episodes - 500:
+            return base
 
-    print("\n" + "═" * 72)
-    print("  ⚡ SecureNet — Dueling DQN + Replay Buffer + Target Network")
-    print("═" * 72)
-    print(f"  Network params  : {sum(p.numel() for p in online.parameters()):,}")
-    print(f"  Action space    : {ACTION_SIZE}")
-    print(f"  Replay buffer   : {args.buffer_size:,}")
-    print(f"  Batch size      : {args.batch_size}")
-    print(f"  Target update   : every {args.target_update} steps")
-    print(f"  Epsilon         : {args.eps_start} → {args.eps_end} over {args.eps_decay_steps} ep")
-    print(f"  Episodes        : {args.episodes}")
-    print("═" * 72 + "\n")
+        # Cyclic epsilon: every 1000 episodes, boost exploration to 0.4 for 200 eps
+        if ep > 500 and (ep % 1000) < 200:
+            return max(base, 0.4)
+            
+        return base
 
     t0 = time.time()
+    print(f"\n  {'='*60}")
+    print(f"  TIER: {difficulty.upper():10s}  |  actions={act_dim}  |  state={STATE_DIM}")
+    print(f"  params={sum(p.numel() for p in online.parameters()):,}  |  episodes={episodes}")
+    print(f"  {'='*60}")
 
-    for ep in range(start_ep, args.episodes + 1):
-
-        # ── Curriculum ───────────────────────────────────────────────
-        if args.difficulty == "progressive" and len(score_history) >= 10:
-            rolling = sum(score_history[-10:]) / 10
-            for cur, nxt, thresh in CURRICULUM:
-                if difficulty == cur and rolling >= thresh:
-                    difficulty = nxt
-                    print(f"\n  🎓 CURRICULUM → {nxt.upper()}  (rolling avg = {rolling:.3f})\n")
-                    break
-
-        # ── Collect episode ──────────────────────────────────────────
+    for ep in range(start_ep, episodes + 1):
         eps      = epsilon(ep)
         resp     = env.reset(difficulty)
-        obs_vec  = obs_to_vec(resp.get("result", ""), -1, None)
+        scalars  = get_scalars(env, resp)
+        obs_vec  = obs_to_vec(resp.get("result", ""), scalars, None)
         done     = resp.get("done", False)
         ep_reward, final_score = 0.0, 0.0
 
         while not done:
             global_step += 1
 
-            # Epsilon-greedy action selection
-            if (len(buf) < args.batch_size) or (random.random() < eps):
-                action_idx = random.randrange(ACTION_SIZE)
+            # Epsilon-greedy with masked actions
+            if len(buf) < args.batch_size or random.random() < eps:
+                action_idx = random.randrange(act_dim)
             else:
                 with torch.no_grad():
                     action_idx = online(obs_vec.unsqueeze(0)).argmax(dim=1).item()
 
-            act_type, node, ip, ioc, proc = ACTIONS[action_idx]
-            resp     = env.step(action_type=act_type, target_node=node,
-                                ip_address=ip, ioc=ioc, process_name=proc)
-            reward   = resp.get("reward", 0.0)
-            done     = resp.get("done", False)
-            nxt_vec  = obs_to_vec(resp.get("result", ""), action_idx, obs_vec)
+            act_type, node, ip, ioc, proc = actions[action_idx]
+            resp    = env.step(action_type=act_type, target_node=node,
+                               ip_address=ip, ioc=ioc, process_name=proc)
+            reward  = resp.get("reward", 0.0)
+            done    = resp.get("done", False)
+            nxt_sc  = get_scalars(env, resp)
+            nxt_vec = obs_to_vec(resp.get("result", ""), nxt_sc, obs_vec)
 
             buf.push(obs_vec, action_idx, reward, nxt_vec, float(done))
-            obs_vec   = nxt_vec
+            obs_vec    = nxt_vec
             ep_reward += reward
 
             if "total_score" in resp.get("info", {}):
                 final_score = resp["info"]["total_score"]
 
-            # ── Learn ─────────────────────────────────────────────────
+            # Learn
             if len(buf) >= args.batch_size:
                 s, a, r, ns, d = buf.sample(args.batch_size)
-
                 with torch.no_grad():
-                    # Double DQN: online selects, target evaluates
-                    best_next_actions = online(ns).argmax(dim=1, keepdim=True)
-                    next_q = target(ns).gather(1, best_next_actions).squeeze(1)
+                    best_next = online(ns).argmax(dim=1, keepdim=True)
+                    next_q    = target(ns).gather(1, best_next).squeeze(1)
                     td_target = r + args.gamma * next_q * (1 - d)
-
                 q_vals = online(s).gather(1, a.unsqueeze(1)).squeeze(1)
-                loss   = F.smooth_l1_loss(q_vals, td_target)  # Huber loss
-
+                loss   = F.smooth_l1_loss(q_vals, td_target)
                 opt.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(online.parameters(), 10.0)
+                nn.utils.clip_grad_norm_(online.parameters(), 5.0)
                 opt.step()
+                scheduler.step()
 
-                # Hard target network update
-                if global_step % args.target_update == 0:
-                    target.load_state_dict(online.state_dict())
+                # Soft target update
+                for tp, op in zip(target.parameters(), online.parameters()):
+                    tp.data.copy_(args.tau * op.data + (1 - args.tau) * tp.data)
 
         all_rewards.append(ep_reward)
         all_scores.append(final_score)
-        score_history.append(final_score)
 
-        # ── Logging ───────────────────────────────────────────────────
+        # Log
         if ep % args.log_interval == 0:
-            avg_r   = np.mean(all_rewards[-args.log_interval:])
-            avg_s   = np.mean(all_scores[-args.log_interval:])
+            avg_r = np.mean(all_rewards[-args.log_interval:])
+            avg_s = np.mean(all_scores [-args.log_interval:])
             elapsed = time.time() - t0
+            pct60 = 100 * sum(1 for s in all_scores[-args.log_interval:] if s >= 0.6) / args.log_interval
             print(
-                f"Ep {ep:>5}/{args.episodes} │ "
-                f"AvgReward {avg_r:>+7.3f} │ "
-                f"AvgScore {avg_s:.3f} │ "
-                f"Tier {difficulty:<9} │ "
-                f"ε={eps:.3f} │ "
-                f"Buf {len(buf):>6} │ "
-                f"Elapsed {elapsed:>5.0f}s"
+                f"  Ep {ep:>5}/{episodes}  AvgR={avg_r:>+7.3f}  AvgScore={avg_s:.3f}"
+                f"  Success%={pct60:.0f}%  eps={eps:.3f}  Buf={len(buf):>5}  {elapsed:>5.0f}s"
             )
 
-        if ep % 100 == 0:
+        # Save
+        if ep % args.save_interval == 0 or ep == episodes:
             torch.save({
-                "online":      online.state_dict(),
-                "target":      target.state_dict(),
-                "optimizer":   opt.state_dict(),
-                "episode":     ep,
-                "difficulty":  difficulty,
-                "global_step": global_step,
-            }, args.checkpoint)
-            with open(args.stats_out, "w") as f:
-                json.dump({"rewards": all_rewards,
-                           "scores":  all_scores,
+                "online": online.state_dict(), "target": target.state_dict(),
+                "optimizer": opt.state_dict(), "episode": ep,
+                "difficulty": difficulty, "global_step": global_step,
+            }, ckpt_path)
+            with open(stats_path, "w") as f:
+                json.dump({"rewards": all_rewards, "scores": all_scores,
                            "difficulty": difficulty}, f)
 
-    # Final saves
-    torch.save({"online": online.state_dict(), "target": target.state_dict(),
-                "optimizer": opt.state_dict(), "episode": args.episodes,
-                "difficulty": difficulty, "global_step": global_step}, args.checkpoint)
-    print(f"\n✅ Done — {args.checkpoint}")
-    print(f"   Total : {(time.time()-t0)/60:.1f} min")
-    print(f"   Final Avg Score (last {args.log_interval} ep): "
-          f"{np.mean(all_scores[-args.log_interval:]):.3f}")
+    # Final summary
+    w = min(500, len(all_scores))
+    final_avg = np.mean(all_scores[-w:])
+    pct60     = 100 * sum(1 for s in all_scores[-w:] if s >= 0.6) / w
+    elapsed   = time.time() - t0
+    print(f"\n  DONE [{difficulty.upper()}]  last{w}_avg={final_avg:.3f}  success%={pct60:.1f}%  time={elapsed/60:.1f}min")
 
-    # Training curve
-    try:
-        import matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(3, 1, figsize=(14, 12), facecolor="#030d0a")
-        cols  = ["#ff3050", "#00ff88", "#00c8ff"]
-        labels = ["Episode Reward", "Containment Score", "Reward (smoothed)"]
-        data   = [all_rewards, all_scores, all_rewards]
-        W = 100
-        roll = lambda a: np.convolve(a, np.ones(W)/W, mode="valid")
+    return online, target, opt, buf, final_avg
 
-        for ax, col, lab, dat in zip(axes, cols, labels, data):
-            ax.set_facecolor("#061410")
-            ax.tick_params(colors="#2a5040")
-            ax.spines[:].set_color("#0d2b22")
-            ax.plot(dat, alpha=0.18, color=col, lw=.6, label="Raw")
-            if len(dat) >= W:
-                ax.plot(range(W-1, len(dat)), roll(dat), color=col, lw=2.2, label=f"Roll({W})")
-            ax.set_title(lab, color="#b0d8c8", fontsize=11)
-            ax.legend(framealpha=0.2, labelcolor="#b0d8c8", fontsize=9)
-            if "Score" in lab:
-                ax.set_ylim(0, 1.05)
 
-        plt.tight_layout(pad=2.5)
-        path = "securenet_env/checkpoints/training_curves.png"
-        plt.savefig(path, dpi=150, bbox_inches="tight")
-        print(f"   Chart → {path}")
-    except ImportError:
-        pass
+# ─────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────
+def main(args):
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    if args.difficulty == "sequential":
+        online, target, opt, buf = None, None, None, None
+        results = {}
+        for tier in TIERS:
+            ckpt_path = os.path.join(args.checkpoint_dir, f"{tier}.pt")
+            online, target, opt, buf, avg = train_tier(
+                tier, args.episodes, args,
+                resume_path=ckpt_path,
+                online=online, target=target, opt=opt,
+                buf=None,   # fresh buffer each tier to avoid cross-tier contamination
+            )
+            results[tier] = avg
+
+        print("\n" + "="*60)
+        print("  SEQUENTIAL TRAINING COMPLETE")
+        print("="*60)
+        for tier, avg in results.items():
+            bar = "#" * int(avg * 40)
+            print(f"  {tier:10s}  last500={avg:.3f}  |{bar}")
+    else:
+        ckpt_path = os.path.join(args.checkpoint_dir, f"{args.difficulty}.pt")
+        train_tier(args.difficulty, args.episodes, args, resume_path=ckpt_path)
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="SecureNet Dueling DQN Trainer")
+    p = argparse.ArgumentParser(description="SecureNet Dueling DQN Trainer v3")
+    p.add_argument("--difficulty",      type=str,   default=DEFAULTS["difficulty"])
     p.add_argument("--episodes",        type=int,   default=DEFAULTS["episodes"])
     p.add_argument("--lr",              type=float, default=DEFAULTS["lr"])
     p.add_argument("--gamma",           type=float, default=DEFAULTS["gamma"])
     p.add_argument("--batch_size",      type=int,   default=DEFAULTS["batch_size"])
     p.add_argument("--buffer_size",     type=int,   default=DEFAULTS["buffer_size"])
-    p.add_argument("--target_update",   type=int,   default=DEFAULTS["target_update"])
+    p.add_argument("--tau",             type=float, default=DEFAULTS["tau"])
     p.add_argument("--eps_start",       type=float, default=DEFAULTS["eps_start"])
     p.add_argument("--eps_end",         type=float, default=DEFAULTS["eps_end"])
     p.add_argument("--eps_decay_steps", type=int,   default=DEFAULTS["eps_decay_steps"])
     p.add_argument("--log_interval",    type=int,   default=DEFAULTS["log_interval"])
-    p.add_argument("--checkpoint",      type=str,   default=DEFAULTS["checkpoint"])
-    p.add_argument("--stats_out",       type=str,   default=DEFAULTS["stats_out"])
-    p.add_argument("--difficulty",      type=str,   default=DEFAULTS["difficulty"])
-    train(p.parse_args())
+    p.add_argument("--save_interval",   type=int,   default=DEFAULTS["save_interval"])
+    p.add_argument("--checkpoint_dir",  type=str,   default=DEFAULTS["checkpoint_dir"])
+    main(p.parse_args())

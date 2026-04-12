@@ -199,7 +199,7 @@ def main():
     openai_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     
     # Environment client
-    client = SecureNetClient("http://localhost:8001")
+    client = SecureNetClient(os.getenv("SERVER_URL", "http://localhost:8000"))
 
     # Verify server health
     try:

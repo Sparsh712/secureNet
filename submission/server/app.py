@@ -148,6 +148,24 @@ def list_tasks():
                 "nodes":             list(NETWORK_TEMPLATES["hard"]["nodes"].keys()),
                 "compromised":       NETWORK_TEMPLATES["hard"]["compromised"],
             },
+            {
+                "id":                "soc_triage_critical",
+                "difficulty":        "critical",
+                "max_steps":         35,
+                "success_threshold": 0.60,
+                "description":       "8-node AD domain compromise — web shell, keylogger, NTDS dump.",
+                "nodes":             list(NETWORK_TEMPLATES["critical"]["nodes"].keys()),
+                "compromised":       NETWORK_TEMPLATES["critical"]["compromised"],
+            },
+            {
+                "id":                "soc_triage_nightmare",
+                "difficulty":        "nightmare",
+                "max_steps":         40,
+                "success_threshold": 0.60,
+                "description":       "12-node nation-state APT — supply chain, k8s, CI/CD, HSM.",
+                "nodes":             list(NETWORK_TEMPLATES["nightmare"]["nodes"].keys()),
+                "compromised":       NETWORK_TEMPLATES["nightmare"]["compromised"],
+            },
         ]
     }
 
